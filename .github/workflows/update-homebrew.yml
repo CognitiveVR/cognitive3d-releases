@@ -1,0 +1,114 @@
+name: Update Homebrew
+
+on:
+  # `released` fires when a full release is published or a prerelease is promoted; never for prereleases.
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to put in the Homebrew tap (e.g. v1.6.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAP: CognitiveVR/homebrew-tap
+    steps:
+      - name: Check the release and the tap's version
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASES_TOKEN: ${{ github.token }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not of the form vX.Y.Z."
+            exit 1
+          fi
+          STATE=$(GH_TOKEN="$RELEASES_TOKEN" gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')
+          if [ "$STATE" != "false false" ]; then
+            echo "::error::$TAG is a draft or a prerelease (isDraft isPrerelease = $STATE). Homebrew only tracks published full releases."
+            exit 1
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::The HOMEBREW_TAP_TOKEN secret is not set."
+            exit 1
+          fi
+          CURRENT=$(gh api "repos/$TAP/contents/Casks/cognitive3d-upload.rb" --jq .content | base64 -d | sed -n 's/^ *version "\(.*\)"$/\1/p')
+          if [ -z "$CURRENT" ]; then
+            echo "::error::Could not read the tap's current version."
+            exit 1
+          fi
+          NEW="${TAG#v}"
+          if [ "$(printf '%s\n%s\n' "$CURRENT" "$NEW" | sort -V | tail -1)" != "$NEW" ]; then
+            echo "::error::$TAG is older than the tap's $CURRENT. The tap was not changed."
+            exit 1
+          fi
+          echo "Tap is on $CURRENT; updating to $NEW."
+
+      - name: Run the tap's update workflow and wait for it
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          URL=$(gh workflow run update-formulae.yml --repo "$TAP" --field version="$TAG")
+          RUN_ID="${URL##*/}"
+          if ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Started the tap's update but could not find its run in: '$URL'"
+            exit 1
+          fi
+          echo "Tap run: $URL"
+          if ! gh run watch "$RUN_ID" --repo "$TAP" --exit-status --interval 10 > /dev/null; then
+            echo "::error::The tap's update run did not succeed: $URL"
+            exit 1
+          fi
+
+      - name: Check the tap now carries the release
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          NEW="${TAG#v}"
+          for attempt in 1 2; do
+            BAD=""
+            for f in Casks/cognitive3d-upload.rb Formula/cognitive3d-upload.rb; do
+              V=$(gh api "repos/$TAP/contents/$f" --jq .content | base64 -d | sed -n 's/^ *version "\(.*\)"$/\1/p')
+              [ "$V" = "$NEW" ] || BAD="$BAD $f is on '$V';"
+            done
+            if [ -z "$BAD" ]; then
+              echo "Cask and formula are on $NEW."
+              exit 0
+            fi
+            [ "$attempt" = 1 ] && sleep 15
+          done
+          echo "::error::Expected $NEW:$BAD"
+          exit 1
+
+      - name: Report to Slack
+        if: failure() || cancelled()
+        timeout-minutes: 2
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_FEED_UPLOAD_WEBAPP }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::error::SLACK_WEBHOOK_FEED_UPLOAD_WEBAPP is not set, so this was not reported."
+            exit 1
+          fi
+          TEXT=":x: Homebrew may not be on Cognitive3D Upload Tool ${TAG} (update job: ${JOB_STATUS}). Log: ${RUN_URL}
+          After fixing the cause, run: \`gh workflow run update-homebrew.yml --repo ${GITHUB_REPOSITORY} --field tag=${TAG}\`"
+          jq -n --arg text "$TEXT" '{text: $text}' |
+            curl -sSf --retry 3 --max-time 20 -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" > /dev/null
